@@ -1,0 +1,6 @@
+[
+  { "id": "sysex-bandit", "version": "1.0.0", "device": "Akai Force", "firmware": "3.9.1", "date": "2026-11-15" },
+  { "id": "sysex-bandit", "version": "1.0.0", "device": "Akai Force", "firmware": "3.10", "date": "2026-11-15" },
+  { "id": "sysex-bandit", "version": "1.0.0", "device": "MPC Live III (Gen2)", "firmware": "3.10", "date": "2026-11-15" },
+  { "id": "sysex-bandit", "version": "1.0.0", "device": "MPC Live III (Gen2)", "firmware": "3.10.1", "date": "2026-11-15" }
+]
