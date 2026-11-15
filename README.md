@@ -1,15 +1,15 @@
 # Sysex Bandit for MPC OS
 
-A VST2 instrument for MPC OS that sends and receives MIDI System Exclusive — the
-desktop Sysex Bandit tool as a plugin: pick or hand-edit a `.syx` message, aim
-`OUT PORT` at the device you want, press SEND, listen on one input and save what
-arrives.
+A VST2 "instrument" for MPC OS that sends and receives MIDI Sysex messages: pick
+or hand-edit a `.syx` message, aim `OUT PORT` at the device you want, press SEND, 
+listen on one input and save what arrives.
 
 It makes no sound. Its "instrument" output is silence; the real I/O is a pair of
 ALSA sequencer ports the plugin opens itself.
 
 ## Which file
 
+[Download the packaged plugins for Gen 1 and 2 here.](https://www.patreon.com/dreamstatic/posts/new-dawn-and-175146717)
 | Device | Zip |
 |---|---|
 | Gen 1 (MPC Live, Live II, One, X, Key, Force) | `Sysex-Bandit-1.0.0-mpc-armv7.zip` |
