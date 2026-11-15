@@ -1,0 +1,18 @@
+# Build outputs (build.sh, test/host_test.sh, test/engine_loop.sh)
+/build/
+/dist/
+
+# Design mockups — reference only, not part of the source
+/mockup/
+
+# Python
+__pycache__/
+*.pyc
+
+# Compiled objects (belt and braces; build/ already covers these)
+*.o
+*.so
+
+# Editor / OS junk
+*~
+.DS_Store

@@ -1,0 +1,23 @@
+/* Sysex Bandit restyle -- loaded after tools/html_art/default.css by layout.conf's
+ * art_css= line. Geometry (where things are, how big) comes from layout.conf and must
+ * not change; only colours, font sizes and effects live here.
+ *
+ * Dark mode: #000000 plate with gradients (bg.svg), light gray text on it, dark gray
+ * text boxes, violet text inside the boxes. Two violets: 9a66d4 for anything set as
+ * text, 5a2494 for fills (the keycaps) and the knobs' pointer and arc. */
+
+:root {
+  --sheen: 0.16;          /* the knob faces' highlight (stock is 0.10) */
+  --label-size: 21px;     /* readout/stepper labels and group labels, was 15 */
+  --button-size: 20px;    /* keycap text, was 15 */
+  --seg-size: 20px;       /* FILE / BYTES, was 14 */
+  --shadow: drop-shadow(0 3px 5px rgba(0, 0, 0, 0.65));
+}
+
+/* The stepper's arrow wells take a dark violet so they belong to the keycap family;
+ * the arrows themselves are the light violet, which is what reads on that well. */
+.arrow-bg { fill: #39295a; }
+
+/* LISTEN's LED, off: a dark violet disc instead of the stock dark red. */
+.look-led { fill: #2a1638; }
+.look-led-bezel { fill: #101010; stroke: #454545; stroke-width: 1.5; }

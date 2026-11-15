@@ -1,0 +1,22 @@
+{
+  "name": "Sysex Bandit",
+  "vendor": "Dream Static Sounds",
+  "uid": "SyxB",
+  "version": 1000,
+  "so": "sysex_bandit.so",
+  "params": "params.json",
+  "layout": "layout.conf",
+  "art": "html",
+  "defines": {
+    "HAS_DISPLAY_REV": 1,
+    "PARAM_TEXT_MAX": 128,
+    "MODULE_SUBDIR": "\"messages\""
+  },
+  "skin_post": "skin_post.py",
+  "build": {
+    "root": ".",
+    "sources": ["src/sysex_bandit.c"],
+    "cflags": [],
+    "libs": ["-lasound", "-lpthread", "-lm"]
+  }
+}
