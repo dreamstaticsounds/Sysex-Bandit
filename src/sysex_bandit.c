@@ -91,9 +91,10 @@
 #define ACC_MAX     (1024 * 1024)  /* reassembly buffer -- ALSA cuts SysEx at 4096 bytes
                                     * per event, so a bank dump arrives as hundreds of
                                     * fragments and all of them have to fit before F7 */
-#define MARQ_W      13         /* characters of a file name the MESSAGE box shows at once;
-                                * longer names scroll through it (its frame is hand-drawn
-                                * artwork 140 px wide, so the box cannot grow) */
+#define MARQ_W      26         /* characters of a file name the MESSAGE box shows at once;
+                                * longer names scroll through it (the box is bw=376 px in
+                                * layout.conf at vs=22: 26 uppercase chars are ~333 px of
+                                * it -- the two settings move together) */
 #define MARQ_GAP    3          /* blanks between the two ends of the scrolling name */
 #define MAX_SUBS    64        /* remembered sweep subscriptions (each direction) */
 #define MAX_TG      64        /* selectable ports per direction (OUT PORT / IN PORT) */

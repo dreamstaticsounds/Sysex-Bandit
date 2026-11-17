@@ -480,16 +480,20 @@ int main(void) {
           automated[i_rxn], automated[i_rxn] == 1 ? "" : "s");
 
     /* -- echo filter: our own bytes coming back are dropped ---------------- */
-    a->setP(a, i_msg, 0.0f);                       /* re-send slot 1 first: the filter's
+    a->setP(a, i_msg, 6.0f / 63.0f);               /* re-send slot 7 first: the filter's
                                                     * window runs from the send, and this
                                                     * suite's own send of it was seconds
-                                                    * ago */
+                                                    * ago. (Slot 7 rather than slot 1: with
+                                                    * nudge_pct on MESSAGE, landing on the
+                                                    * minimum from within its range is one
+                                                    * tick, not a jump, so a reset to slot 1
+                                                    * would come to rest a slot short.) */
     (void)a->getP(a, i_msg);                       /* a set of param 0 waits for a flush */
     tap(a, i_send);
     CHECK(wait_sent(a, i_st), "the echo fixture leaves the queue again");
-    probe_drain(got, 8);                           /* the copy the probe received */
+    probe_drain(got, 8);                           /* the copies the probe received */
     rxn_before = a->getP(a, i_rxn);
-    probe_send(ident, sizeof ident);               /* the same bytes coming straight back */
+    probe_send(gm, sizeof gm);                     /* the same bytes coming straight back */
     usleep(400000);
     CHECK(a->getP(a, i_rxn) == rxn_before, "the echo filter drops our own message coming back");
 
@@ -554,7 +558,7 @@ int main(void) {
      *    forever -- without this, a round-trip test loses its replies -------- */
     rxn_before = a->getP(a, i_rxn);
     usleep(5500000);                              /* well past ECHO_MS since that send */
-    CHECK(probe_send(ident, sizeof ident) >= 0 && rx_seen(a, i_rxn, rxn_before),
+    CHECK(probe_send(gm, sizeof gm) >= 0 && rx_seen(a, i_rxn, rxn_before),
           "after the echo window the same bytes count again (%.3f -> %.3f)",
           rxn_before, a->getP(a, i_rxn));
 
@@ -791,13 +795,13 @@ int main(void) {
             dispd(a, i_msg, w1, sizeof w1);
             run(a, 240);                            /* several display_rev polls */
             dispd(a, i_msg, w2, sizeof w2);
-            CHECK(strlen(w1) == 13 && strcmp(w1, w2) != 0,
+            CHECK(strlen(w1) == 26 && strcmp(w1, w2) != 0,
                   "the long name scrolls in the MESSAGE box (\"%s\" -> \"%s\")", w1, w2);
 
             /* -- selecting a file restarts its scroll at the head ------------ */
-            char head[16], one[16], w3[64];
-            memcpy(head, LONGN, 13); head[13] = 0;      /* the window at phase 0 */
-            memcpy(one, LONGN + 1, 13); one[13] = 0;    /* and at phase 1, in case a
+            char head[32], one[32], w3[64];
+            memcpy(head, LONGN, 26); head[26] = 0;    /* the window at phase 0 */
+            memcpy(one, LONGN + 1, 26); one[26] = 0;  /* and at phase 1, in case a
                                                          * display_rev poll slipped
                                                          * in between set and read */
             a->setP(a, i_msg, 0.0f);                    /* another file ... */

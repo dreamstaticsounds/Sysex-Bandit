@@ -364,15 +364,23 @@ int main(void) {
         }
         a->setP(a, i, 0.5f);
         CHECK(fabsf(a->getP(a, i) - 0.5f) <= 0.5f / range + 1e-3f, "%s: a jump past the nudge range lands outright (%.3f)", p->key, a->getP(a, i));
-        a->setP(a, i, 1.0f - 1.0f / 128);
+        a->setP(a, i, (float)(range - 1) / range);   /* exactly one step below the top: 1-1/128 sits
+                                                      * range/128 above it, which on a short range
+                                                      * (63) rounds straight onto the maximum and
+                                                      * leaves the clamped move nothing to step up from */
         float below = roundf(a->getP(a, i) * range);
         a->setP(a, i, 1.0f);   /* clamped at the maximum from within the nudge range: one step up, not a jump to the end */
         CHECK(fabsf(a->getP(a, i) * range - (below + 1)) < 0.05f, "%s: at the top a clamped move is one step (%.2f from %.0f)", p->key, a->getP(a, i) * range, below);
         a->setP(a, i, p->def);
         break;
     }
-    for (int i = 0; i < NPARAMS; i++)   /* the first whole-number param */
-        if (!PARAMS[i].nopts && PARAMS[i].int_display && PARAMS[i].qlink_ticks <= 1 && PARAMS[i].max - PARAMS[i].min >= 2) { step_tests(a, i, "int", (int)(PARAMS[i].max - PARAMS[i].min)); break; }
+    for (int i = 0; i < NPARAMS; i++)   /* the first whole-number param -- but not a "nudge_pct"
+                                          one: its small moves are ticks by design, so step_tests'
+                                          absolute sweeps (which assume plain settle()) would
+                                          zigzag a lagging drag; those params are covered by their
+                                          own block above */
+        if (!PARAMS[i].nopts && PARAMS[i].int_display && PARAMS[i].qlink_ticks <= 1 &&
+            PARAMS[i].nudge_pct <= 0 && PARAMS[i].max - PARAMS[i].min >= 2) { step_tests(a, i, "int", (int)(PARAMS[i].max - PARAMS[i].min)); break; }
     if (pop >= 0) {
         int t = PARAMS[pop].popup_of, n = PARAMS[t].nopts;
         a->setP(a, pop, 1); CHECK(a->getP(a, pop) > 0.5f, "popup %s opens", PARAMS[pop].key);
