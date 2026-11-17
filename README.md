@@ -10,10 +10,11 @@ ALSA sequencer ports the plugin opens itself.
 ## Which file
 
 [Download the packaged plugins for Gen 1 and 2 here.](https://www.patreon.com/dreamstatic/posts/new-dawn-and-175146717)
+
 | Device | Zip |
 |---|---|
-| Gen 1 (MPC Live, Live II, One, X, Key, Force) | `Sysex-Bandit-1.0.0-mpc-armv7.zip` |
-| Gen 2 (the "3" models) | `Sysex-Bandit-1.0.0-mpc-aarch64.zip` |
+| Gen 1 (MPC Live, Live II, One, X, Key, Force) | `Sysex-Bandit-1.0.1-mpc-armv7.zip` |
+| Gen 2 (the "3" models) | `Sysex-Bandit-1.0.1-mpc-aarch64.zip` |
 
 The installer checks the architecture and refuses the wrong one. Both builds
 target MPC OS 3.x.
@@ -24,8 +25,8 @@ You need root shell access (SSH) — stock MPC OS doesn't offer it; you need a
 modded unit. Back up first.
 
 ```sh
-scp -r Sysex-Bandit-1.0.0 root@<device-ip>:/tmp/
-ssh root@<device-ip> sh /tmp/Sysex-Bandit-1.0.0/install.sh
+scp -r Sysex-Bandit-1.0.1 root@<device-ip>:/tmp/
+ssh root@<device-ip> sh /tmp/Sysex-Bandit-1.0.1/install.sh
 ```
 
 The installer stops MPC (save your project first), copies the plugin folder into
@@ -60,14 +61,23 @@ This is the part that surprises people coming from the desktop app:
   works the same way: pick your synth and the plugin counts only what *it* says,
   not the whole box's SysEx traffic. Sending works regardless of LISTEN — LISTEN
   only gates receiving.
+- **The pick follows the device, not its place in the list.** The lists are
+  rebuilt in ALSA's own order every sweep, so another app starting or stopping
+  shifts every entry after it. Your pick is remembered by identity — the port's
+  `client:port`, with its `client:port` name as the fallback — so when the list
+  moves the selector moves with it (the arrows keep stepping from where the
+  device is now), a device that restarts under a new id is found again by name
+  on the next sweep, and only a port that is really gone reads `(gone)`.
 
 In short: install, load, step `OUT PORT` onto your device, flip **LISTEN** on
 and step `IN PORT` onto your source. Nothing else to configure.
 
 ## Pages
 
-**SEND** — `MESSAGE` picks a slot (1–16) from the plugin's `messages/` folder;
-`SOURCE` switches between the slot's file and hand-edited bytes; `PREV`/`NEXT`
+**SEND** — `MESSAGE` picks a slot (1–64) from the plugin's `messages/` folder;
+the slot's file name shows under the knob, and a name too long for its box
+scrolls through it, so the end of a long name is always readable. `SOURCE`
+switches between the slot's file and hand-edited bytes; `PREV`/`NEXT`
 step through slots; `SEND` transmits; `RESCAN` re-reads the `messages/` folder
 (do this after adding files yourself). `OUT PORT` (default **`None`**) aims the
 send at one output device; its `◀`/`▶` step through what's connected, and with
@@ -88,41 +98,65 @@ this way does **not** have to end in `F7` — count is count.
   one port and only it counts. This is the cure for an `RX TOTAL` that climbs
   while nothing of yours is sending — MPC OS and other apps talk SysEx too, and
   hearing everything counts all of it.
-- `RX`: the last complete message received, as hex wrapped across all six lines
+- `RX`: the message `RX MSG` selects, as hex wrapped across all six lines
   of the big box — the same display `TX` uses for the selected message.
+- `RX MSG`: steps through **every message in the capture**. The `◀`/`▶` arrows
+  walk the run, the field reads `n/m` (e.g. `3/210`), and a new message moves
+  the view to the newest one. Everything received since CLEAR is kept — a bank
+  dump that arrives as a run of ~120-byte blocks can be read back block by
+  block instead of only the last one.
 - `RX TOTAL`: **count of complete messages received, not bytes** — it wraps at
   999. Your 210-byte patch counts as 1. A long dump arriving in pieces counts
   as 1 too: ALSA cuts SysEx at 4096 bytes per event, so a **bank dump** arrives
   as a run of fragments and the plugin reassembles `F0 … F7` across them before
   counting (stray bytes between messages are ignored, and an abandoned partial
   message is dropped when a new `F0` starts). Messages up to **1 MB** are
-  reassembled, counted and stored whole, so `SAVE RX` writes a bank dump back
-  byte for byte.
-- `STATUS`: last event and who sent it, e.g. `rx 210 B from ESQ-1` — that name
-  is how you find out what has been talking.
-- `SAVE RX`: writes the last received message to `messages/rx_NNN.syx`; it
-  becomes a SEND slot after the automatic re-scan.
-- `CLEAR`: resets `RX`, `RX TOTAL` and the saved-message buffer — start a fresh
-  capture without reloading the plugin.
+  reassembled and counted whole; the capture behind `RX MSG`/`SAVE RX` holds
+  up to 4 MB across 4096 messages.
+- `STATUS`: last event, who sent it and how big the capture has grown, e.g.
+  `rx 123 B from JD-990 (210 msg, 26 KB)` — that name is how you find out what
+  has been talking.
+- `SAVE RX`: writes the **whole capture** — every message since CLEAR, in
+  order — to `messages/rx_NNN.syx` as a normal multi-message `.syx`; it
+  becomes a SEND slot after the automatic re-scan. (A single patch saves as
+  itself; a 32 KB bank saved from its last block alone does not.)
+- `CLEAR`: empties the capture and resets `RX TOTAL` — start a fresh capture
+  without reloading the plugin.
+
+**SPEED** — how fast `SEND` transmits, in the spirit of Midi-OX's sysex
+settings, so a big dump doesn't overrun the synth's input buffer:
+
+- `DELAY`: ms to wait after every `F7` before the next message (default 10).
+- `BUF`: how many bytes of one message go out per block (default 512).
+- `GAP`: ms to wait between those blocks (default 1).
+
+The defaults are deliberately gentle: a 32 KB dump takes about a second and
+lands whole. Turn all three down to 0 for full throttle, or turn `DELAY`/`GAP`
+up if a receiver still complains. `STATUS` on this page shows a running send's
+progress (`sending 3/210 msg`).
 
 ## Your own messages
 
 The plugin's message folder lives inside its own folder on the device:
 `/sdcard/Synths/Dream Static Sounds - VST - Sysex Bandit/messages/`. Drop any
-`.syx` file in there (up to 16 slots, sorted by name), press `RESCAN`, and it
+`.syx` file in there (up to 64 slots, sorted by name), press `RESCAN`, and it
 appears under `MESSAGE`. Files you add are kept across upgrades and uninstalls.
 
 ## Q-Links
 
 Q-Links follow the page on screen. On SEND: CC 20 = MESSAGE, CC 21 = SOURCE,
-CC 22 = OUT PORT. On RECEIVE: CC 20 = LISTEN, CC 21 = CLEAR, CC 22 = IN PORT.
+CC 22 = OUT PORT, CC 23 = RESCAN. On BYTES: CC 20 = COUNT, CC 21–28 = B1–B8.
+On RECEIVE: CC 20 = LISTEN, CC 21 = CLEAR, CC 22 = IN PORT, CC 23 = RX MSG.
+On SPEED: CC 20 = DELAY, CC 21 = BUF, CC 22 = GAP.
 
 ## Troubleshooting
 
 - **Nothing arrives**: is `LISTEN` on? Is `IN PORT` still `None`, or pointed at
   the right source? Is the sender actually transmitting? `aconnect -l` shows
   whether the subscriptions exist — look for the client **Sysex Bandit** and
-  who is connected to its `SysEx In`.
+  who is connected to its `SysEx In`. A source that has vanished reads
+  `(gone)` and hears nothing until it is back — the selector re-finds it by
+  name on the next sweep, so no re-picking is needed.
 - **RX TOTAL keeps climbing when you didn't send anything**: something on the
   box is talking SysEx — MPC OS and other apps do too. Point `IN PORT` at your
   device and only its traffic counts; `STATUS` names whoever is sending either
@@ -130,9 +164,16 @@ CC 22 = OUT PORT. On RECEIVE: CC 20 = LISTEN, CC 21 = CLEAR, CC 22 = IN PORT.
   capturing.
 - **SEND says `pick OUT PORT`**: `OUT PORT` is on `None`, so there is no
   destination at all. Step it onto the device you want.
-- **`out port N not found`**: the picked device was unplugged. The plugin
-  refuses rather than broadcasting your dump to everything else — step
-  `OUT PORT` onto a port that is still there, or back to `None`.
+- **`out port N not found`**: the picked device is gone — unplugged, or its app
+  closed. The plugin refuses rather than broadcasting your dump to everything
+  else. Re-plug it and the selector finds it again by name on the next sweep;
+  or step `OUT PORT` onto a port that is still there, or back to `None`.
+- **A big dump arrives garbled, truncated or refuses to load on the synth**:
+  the receiver's input buffer is overflowing — 1.0.0 sent everything at full
+  throttle. Turn `DELAY` and `GAP` up (or lower `BUF`) on the SPEED page until
+  the dump lands whole; the defaults are already gentle.
+- **`STATUS` reads `sending n/m msg` for a while**: that's the SPEED page
+  pacing a multi-message file out block by block — normal for a bank dump.
 - **No sound is expected** — it's a silent instrument; the audio output is
   always silence.
 - **A send seems to vanish**: check nothing else (another app) is holding the
@@ -150,7 +191,8 @@ MPC_VST=/path/to/mpc-vst-plugins ./build.sh              # armv7 (MM-303 armhf i
 MPC_VST=/path/to/mpc-vst-plugins ARCH=aarch64 ./build.sh # aarch64 (mm303:aarch64-audio)
 ./test/host_test.sh           # x86 host test, ASan/UBSan
 ./test/engine_loop.sh         # live ALSA loopback: sweep, both port pickers,
-                              # send targeting, reassembly, LISTEN, CLEAR
+                              # send targeting, reassembly, LISTEN, the capture
+                              # + RX MSG stepping, tx pacing, the scrolling name
 ```
 
 The kit supplies the VST2 wrapper (`wrapper/vst2_wrap.c`), the params/skin

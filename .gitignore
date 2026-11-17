@@ -13,6 +13,10 @@ __pycache__/
 *.o
 *.so
 
+# Third-party feedback drops (private correspondence: video, dumps, notes) —
+# not ours to publish; kept on disk only
+/Gonz*Feedback*/
+
 # Editor / OS junk
 *~
 .DS_Store

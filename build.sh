@@ -19,16 +19,21 @@ MPC_VST="${MPC_VST:-$PWD/../mpc-vst-plugins}"
   echo "build.sh: mpc-vst-plugins not found at '$MPC_VST'" >&2
   echo "set MPC_VST=<path-to-kit> (upstream: https://github.com/open-mpc/mpc-vst-plugins)" >&2
   exit 1; }
+# canonical path: the default's ".." would lexically start with $PWD and be mistaken for a
+# checkout inside the repo below, so the container would never mount the kit at all
+MPC_VST="$(cd "$MPC_VST" && pwd)"
 ARCH="${ARCH:-armhf}"
 MM303_ARMHF="${MM303_ARMHF:-mm303:armhf-glibc231-audio}"
 MM303_AARCH64="${MM303_AARCH64:-mm303:aarch64-audio}"
-NAME="Dream Static Sounds - VST - Sysex Bandit"
 case "$ARCH" in
   armhf)   OUT="build/arm"     PKGDIR="build/package"     IMAGE="$MM303_ARMHF" ;;
   aarch64) OUT="build/arm64"   PKGDIR="build/package-aarch64" IMAGE="$MM303_AARCH64" ;;
   *) echo "build.sh: ARCH must be armhf or aarch64 (got '$ARCH')" >&2; exit 1 ;;
 esac
 eval "$(python3 "$MPC_VST/tools/gen_vst.py" vst.json --shell)"
+# that eval exports NAME= too (the plugin's short name): restate the package folder
+# name it shadows -- "vendor - VST - name", what the installer and README expect.
+NAME="Dream Static Sounds - VST - Sysex Bandit"
 
 mkdir -p build/tools "$OUT"
 # skin artwork renderer: "art": "html" in vst.json (gradient plate, keycap images, real font)

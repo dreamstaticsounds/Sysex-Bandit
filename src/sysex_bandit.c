@@ -15,18 +15,28 @@
  * Incoming SysEx is reassembled before it counts: ALSA hands a long message over
  * in several events -- it cuts at 4096 bytes, so a bank dump arrives as hundreds of
  * fragments -- and the reader accumulates bytes and accepts only complete F0..F7
- * messages, the app's extract_messages() rule. One dump = one counted message, and
- * SAVE RX keeps it whole instead of the last fragment. The reassembly and saved
- * buffers are 1 MB each: a patch is a few hundred bytes, a bank dump is not.
+ * messages, the app's extract_messages() rule. One dump = one counted message.
+ *
+ * Every accepted message is APPENDED to a capture buffer (the app's whole session,
+ * not just the last block): a JD-990 bank dump is a run of ~120-byte messages, and
+ * 1.0.0 only kept the newest of them, so SAVE RX wrote 123 bytes of a 32 KB bank.
+ * The capture holds every message since CLEAR (4 MB / 4096 messages), RX MSG steps
+ * through it (n/m, newest first: a new message moves the view to the end), SAVE RX
+ * writes the whole run back as a normal multi-message .syx, and the reassembly
+ * buffer is 1 MB: a patch is a few hundred bytes, a bank dump is not.
  *
  * Both directions are pickable, because a box with two synths plugged in must not
  * get a dump aimed at the other one, and because MPC OS's own clients talk SysEx
- * too: OUT PORT = ALL (every wired port, the default) or one discovered writable
- * port, addressed with snd_seq_ev_set_dest instead of a broadcast; IN PORT = ALL
- * (every readable port) or one discovered readable port, the only one the sweep
- * subscribes. The Nth port is the Nth in ALSA's own discovery order -- client id,
- * then port id, the order aconnect -l prints -- and the readout names it, so a
- * device coming and going shows up instead of silently changing meaning.
+ * too: OUT PORT picks one discovered writable port, addressed with
+ * snd_seq_ev_set_dest instead of a broadcast (None is the default and a real
+ * choice: SEND is refused rather than sprayed at everything); IN PORT picks one
+ * discovered readable port, the only one the sweep subscribes (None: nobody).
+ * The Nth port is the Nth in ALSA's own discovery order -- client id,
+ * then port id, the order aconnect -l prints -- but the PICK is remembered by
+ * identity (client:port, then the "client:port" name): another client coming or
+ * going shifts every index after it, and a client that restarts keeps its name
+ * under a new id, so the pick follows the device instead of silently changing
+ * meaning, and a port that is really gone reads (gone) and refuses.
  *
  * Threading: the wrapper serialises its own engine calls, but a reader thread
  * shares this struct, so everything the reader touches also takes sb->lock (the
@@ -35,6 +45,13 @@
  * touches shared state, so audio never waits on it. The mutex is
  * priority-inheriting like the wrapper's, so a sweep can't invert an RT audio
  * thread that polls us from housekeeping().
+ *
+ * SEND never blocks the host thread: do_send() loads the file and hands it to the
+ * tx thread, which paces it out (tx_gap ms per tx_buf-byte block, tx_delay ms after
+ * every F7 -- the Midi-OX sysex settings) and then reports the same STATUS line a
+ * synchronous send used to. A 32 KB dump at full throttle overruns the receiving
+ * synth's input buffer; at the defaults (10 ms after F7, 512 B per 1 ms block) it
+ * takes about a second and lands whole.
  *
  * The reader must poll() once and then drain snd_seq_event_input() to -EAGAIN:
  * poll-per-event stalls the moment a burst arrives (proven in
@@ -64,15 +81,20 @@
 
 #define SB_TEXT     64        /* == PARAM_TEXT_MAX (vst.json): room for 63 chars + NUL */
 #define SB_NAME     96        /* one .syx file name */
-#define MAX_MSGS    16        /* message slots 1..16 */
+#define MAX_MSGS    64        /* message slots 1..64 */
 #define MAX_FILES   256       /* .syx names considered when sorting the folder */
 #define MAX_FILE    (4 * 1024 * 1024)  /* app's size cap for one .syx file */
-#define MAX_RX      (1024 * 1024)  /* last received message kept for SAVE RX: a whole
-                                    * bank dump, not just a patch. calloc'd, so the pages
-                                    * only exist once a dump that big actually arrives. */
+#define CAP_MAX     (4 * 1024 * 1024)  /* capture: every complete message since CLEAR, so
+                                        * SAVE RX writes the whole bank dump and not just
+                                        * its last block. malloc'd in sb_create. */
+#define CAP_MSGS    4096       /* message starts remembered, for RX MSG to step over */
 #define ACC_MAX     (1024 * 1024)  /* reassembly buffer -- ALSA cuts SysEx at 4096 bytes
                                     * per event, so a bank dump arrives as hundreds of
                                     * fragments and all of them have to fit before F7 */
+#define MARQ_W      13         /* characters of a file name the MESSAGE box shows at once;
+                                * longer names scroll through it (its frame is hand-drawn
+                                * artwork 140 px wide, so the box cannot grow) */
+#define MARQ_GAP    3          /* blanks between the two ends of the scrolling name */
 #define MAX_SUBS    64        /* remembered sweep subscriptions (each direction) */
 #define MAX_TG      64        /* selectable ports per direction (OUT PORT / IN PORT) */
 #define TX_LINES    6         /* TX box lines: layout.conf stacks one readout per line,
@@ -84,8 +106,22 @@
 #define RX_BPL      27        /* 80 chars: the widest line that still fits the buffer */
 #define SEL_MAX     256       /* head of the selected message kept for the TX box */
 #define ECHO_SLOTS  8         /* recent sends recognised as their own echo */
+#define ECHO_MS     5000      /* ... but only for this long after the send: the same
+                               * bytes arriving minutes later are a real message
+                               * (a read-back of the patch you just sent) */
 #define SWEEP_MS    2000      /* LISTEN sweep period */
 #define POLL_MS     200       /* reader sleep; also the quit reaction time */
+
+/* One discovered port, and the pick remembered by identity. The lists are rebuilt
+ * in ALSA's discovery order every sweep, so an index stops meaning anything the
+ * moment another client comes or goes: client:port first, the "client:port" name
+ * as the fallback (a client that restarts -- MPC reloaded, the sender app bounced
+ * -- gets a new id but keeps its name). aim_t: client < 0 = not matched against
+ * the list yet (a restored chunk before the first sweep), gone = matched and no
+ * longer there. name[0] == 0 means no pick at all. */
+typedef struct { int client, port; char name[SB_TEXT]; } tgt_t;
+typedef struct { int client, port, gone; char name[SB_TEXT]; } aim_t;
+typedef struct { uint32_t h; long long at; } echo_t;   /* a sent message, and when */
 
 typedef struct {
     snd_seq_t *seq;
@@ -96,24 +132,39 @@ typedef struct {
     pthread_mutex_t lock;
 
     /* settings the host owns (params.json defaults) */
-    int message;              /* 1..16 slot */
+    int message;              /* 1..MAX_MSGS slot */
     int send_src;             /* 0 FILE, 1 BYTES */
     int nbytes;               /* 1..8 */
     int b[8];
     int listen;               /* 0 OFF, 1 ON */
-    int send_to;              /* 0 ALL, else the Nth discovered writable port */
-    int recv_from;            /* 0 ALL, else the Nth discovered readable port */
+    int send_to;              /* 0 None, else the Nth discovered writable port */
+    int recv_from;            /* 0 None, else the Nth discovered readable port */
+    int tx_delay;             /* ms to wait after every F7 before the next message */
+    int tx_buf;               /* bytes per paced block of one message */
+    int tx_gap;               /* ms to wait between those blocks */
 
     /* engine-driven readouts */
     char status[SB_TEXT], folder[SB_TEXT], port_str[SB_TEXT];
     int rx_total;             /* complete messages received (wraps 0..999) */
-    uint8_t rx_bytes[MAX_RX];
-    int rx_len;
+    /* the capture: every complete message since CLEAR, one after the other, with
+     * cap_off[] marking where each starts. RX shows rx_msg of them (a new message
+     * moves rx_msg to the end), SAVE RX writes all of cap_len. */
+    uint8_t *cap;
+    int cap_len, cap_msgs;
+    int cap_off[CAP_MSGS];
+    int rx_msg;               /* 1-based index into the capture, 1 when it is empty */
     uint8_t acc[ACC_MAX];     /* incoming stream, reassembled into F0..F7 here */
     int acc_len;
     uint8_t sel[SEL_MAX];     /* head of the message the TX box shows */
     int sel_len;
     int sel_dirty;            /* the selection changed: re-read it before the next line */
+    unsigned marq_ph;         /* file-name scroll phase, advanced by rev_hash so the
+                               * wrapper's display_rev change repaints the MESSAGE box */
+    unsigned marq_tick;       /* half of those polls advance marq_ph: 1 char / 200 ms */
+    char marq_nm[SB_NAME];    /* the name marq_ph belongs to: selecting another file
+                               * starts its window at the beginning again */
+    int marq_of;              /* and the slot it belongs to (a fast turn A->B->A between
+                               * two display reads must restart too) */
 
     /* message folder */
     char dir[512];
@@ -130,13 +181,34 @@ typedef struct {
 
     /* what OUT PORT / IN PORT can pick: every usable port on the sequencer, in
      * discovery order, with the name the readout shows (rebuilt every sweep) */
-    struct { int client, port; char name[SB_TEXT]; } tg_in[MAX_TG];
+    tgt_t tg_in[MAX_TG];
     int ntg_in;
-    struct { int client, port; char name[SB_TEXT]; } tg_out[MAX_TG];
+    tgt_t tg_out[MAX_TG];
     int ntg_out;
+    /* the pick each picker is aimed at, kept across rebuilds by identity: the
+     * index follows the port when the list shifts (resolve_pick) */
+    aim_t aim_in, aim_out;
 
-    /* echo filter: hashes of the last ECHO_SLOTS messages we sent */
-    uint32_t echo[ECHO_SLOTS];
+    /* the queued SEND, drained by tx_thread under this lock (never on the host
+     * thread: a paced 32 KB dump takes about a second) */
+    uint8_t *txq;             /* file bytes, or the one BYTES message; owned by the queue */
+    size_t txq_len, tx_pos;   /* tx_pos: where the next message starts */
+    size_t tx_ms, tx_me;      /* the message open now: [tx_ms, tx_me), empty when equal */
+    uint32_t tx_hash;         /* running hash of that message, for the echo filter */
+    int tx_active, tx_quit;
+    int tx_direct;            /* the queue IS one message (BYTES): no F0..F7 scan */
+    int tx_done, tx_total;    /* messages finished / messages in the file */
+    size_t tx_bytes, tx_total_bytes;
+    int tx_stray;
+    snd_seq_addr_t tx_dst;    /* OUT PORT resolved once, when SEND was pressed */
+    struct timespec tx_due;   /* when the next block may go out (CLOCK_REALTIME) */
+    pthread_t tx_thr;
+    int tx_thr_on;
+    pthread_cond_t tx_cv;
+
+    /* echo filter: the last ECHO_SLOTS messages we sent, each with the time it
+     * went out -- only a fresh one is dropped as "our own echo" */
+    echo_t echo[ECHO_SLOTS];
     int echo_n;
 } sb_t;
 
@@ -200,6 +272,22 @@ static const char *slot_name(sb_t *s) {
     return (s->message >= 1 && s->message <= s->nmsgs) ? s->names[s->message - 1] : NULL;
 }
 
+/* The scroll window belongs to one file: when a different one is selected the window
+ * starts at the beginning, so the box shows the head of the new name right away instead
+ * of continuing from wherever the last one stopped (marq_tick = 1 holds the head for one
+ * poll before scrolling resumes). Called on every selection change and every display
+ * read, always with sb->lock held. */
+static void marq_sync(sb_t *s) {
+    const char *nm = slot_name(s);
+    const char *want = nm ? nm : "";
+    if (s->marq_of != s->message || strcmp(s->marq_nm, want) != 0) {
+        snprintf(s->marq_nm, sizeof s->marq_nm, "%s", want);
+        s->marq_of = s->message;
+        s->marq_ph = 0;
+        s->marq_tick = 1;
+    }
+}
+
 /* ------------------------------------------------------- the TX selection */
 
 /* Head of the message the TX box shows: the edited bytes, or the slot's file
@@ -252,6 +340,38 @@ static int put_line(char *buf, int n, const char *s) {
     return 1;
 }
 
+/* The message RX shows: rx_msg of the capture (1-based), 0 when there is none.
+ * Clamped here too -- the capture can shrink under a restored preset. */
+static int rx_sel(sb_t *s, int *off) {
+    *off = 0;
+    if (!s->cap || s->cap_msgs <= 0) return 0;
+    int i = clampi(s->rx_msg, 1, s->cap_msgs);
+    int st = s->cap_off[i - 1];
+    int en = (i < s->cap_msgs) ? s->cap_off[i] : s->cap_len;
+    *off = st;
+    return en - st;
+}
+
+/* The MESSAGE box's frame is hand-drawn artwork 140 px wide, so a name longer than
+ * MARQ_W characters cannot be shown whole: it scrolls through that window instead.
+ * rev_hash advances marq_ph, which moves display_rev, which is what makes the
+ * wrapper ask for this text again (a Label clips, it never wraps or shrinks). */
+static const char *msg_name(sb_t *s, char *out, int cap) {
+    marq_sync(s);                              /* a new file starts its window at the head */
+    const char *nm = slot_name(s);
+    if (!nm) return s->nmsgs ? "(none)" : "(empty)";
+    int len = (int)strlen(nm);
+    if (len <= MARQ_W) return nm;
+    int o = 0;
+    unsigned ph = s->marq_ph % (unsigned)(len + MARQ_GAP);
+    for (int i = 0; i < MARQ_W && o < cap - 1; i++) {
+        unsigned k = ph + (unsigned)i;
+        out[o++] = (k < (unsigned)len) ? nm[k] : ' ';
+    }
+    out[o] = 0;
+    return out;
+}
+
 static int tx_line(sb_t *s, int ln, char *buf, int n) {
     if (s->send_to <= 0)                        /* OUT PORT None: nothing selected to send */
         return put_line(buf, n, ln == 1 ? "-" : "");
@@ -261,8 +381,9 @@ static int tx_line(sb_t *s, int ln, char *buf, int n) {
 }
 
 static int rx_line(sb_t *s, int ln, char *buf, int n) {
-    if (ln == 1 && s->rx_len <= 0) return put_line(buf, n, "-");
-    hex_line(s->rx_bytes, s->rx_len, (ln - 1) * RX_BPL, RX_BPL, buf, n);
+    int off = 0, len = rx_sel(s, &off);
+    if (ln == 1 && len <= 0) return put_line(buf, n, "-");
+    hex_line(s->cap + off, len, (ln - 1) * RX_BPL, RX_BPL, buf, n);
     return 1;
 }
 
@@ -275,6 +396,86 @@ static int line_no(const char *key, char letter, int lines) {
 }
 
 /* ---------------------------------------------------------- port targets */
+
+/* The pick is remembered by identity, not by its place in the list. aim_clear
+ * drops it (the user stepped elsewhere: the next rebuild re-aims from the new
+ * index), aim_take reads it off the list at the current index, aim_restore
+ * brings back a chunk's saved name. All under s->lock. */
+static void aim_clear(sb_t *s, int out) {
+    aim_t *a = out ? &s->aim_out : &s->aim_in;
+    a->client = a->port = -1;
+    a->gone = 0;
+    a->name[0] = 0;
+}
+
+static void aim_take(sb_t *s, int out) {
+    aim_t *a = out ? &s->aim_out : &s->aim_in;
+    int idx = out ? s->send_to : s->recv_from;
+    int cnt = out ? s->ntg_out : s->ntg_in;
+    tgt_t *t = out ? s->tg_out : s->tg_in;
+    aim_clear(s, out);
+    if (idx >= 1 && idx <= cnt) {
+        a->client = t[idx - 1].client;
+        a->port = t[idx - 1].port;
+        snprintf(a->name, sizeof a->name, "%s", t[idx - 1].name);
+    }
+}
+
+/* A restored chunk: the saved name wins over the saved index (the list may have
+ * moved around since it was written), an index-only chunk (1.0.0 and earlier)
+ * re-aims from whatever sits at that index on the next rebuild, exactly as it
+ * used to. Either way the name is settled by resolve_pick() on the next sweep. */
+static void aim_restore(sb_t *s, int out, const char *name) {
+    aim_t *a = out ? &s->aim_out : &s->aim_in;
+    int idx = out ? s->send_to : s->recv_from;
+    aim_clear(s, out);
+    if (idx > 0 && name && name[0]) {
+        a->client = a->port = -1;                 /* pending: not matched yet */
+        snprintf(a->name, sizeof a->name, "%s", name);
+    }
+}
+
+/* The pick's identity as the chunk should keep it: the aim when it has one, the
+ * name at the current index otherwise (the readout shows that same name). */
+static const char *aim_name(sb_t *s, int out) {
+    const aim_t *a = out ? &s->aim_out : &s->aim_in;
+    int idx = out ? s->send_to : s->recv_from;
+    int cnt = out ? s->ntg_out : s->ntg_in;
+    if (a->name[0]) return a->name;
+    if (idx >= 1 && idx <= cnt) return (out ? s->tg_out : s->tg_in)[idx - 1].name;
+    return "";
+}
+
+/* Re-aim both picks at the freshly built list: exact client:port first, then the
+ * remembered "client:port" name. A pick found somewhere else moves its index
+ * along with the port, so the readout, the arrows and the saved chunk all keep
+ * agreeing on the same device; a pick that is nowhere is marked gone and left
+ * where it was, so the readout says (gone) instead of quietly coming to mean
+ * whatever now sits at that index -- and it is re-checked every sweep, so the
+ * device coming back (or coming back under a new id) re-finds it by name.
+ * Called from rebuild_targets, always under s->lock. */
+static void resolve_pick(sb_t *s) {
+    for (int out = 0; out < 2; out++) {
+        aim_t *a = out ? &s->aim_out : &s->aim_in;
+        int *pick = out ? &s->send_to : &s->recv_from;
+        tgt_t *t = out ? s->tg_out : s->tg_in;
+        int cnt = out ? s->ntg_out : s->ntg_in;
+        if (*pick <= 0) { aim_clear(s, out); continue; }        /* None: nobody */
+        if (!a->name[0]) aim_take(s, out);                     /* index-only pick */
+        if (!a->name[0]) continue;                             /* index past the end: (gone) by index */
+        int found = -1;
+        for (int i = 0; i < cnt && found < 0; i++)
+            if (t[i].client == a->client && t[i].port == a->port) found = i;
+        for (int i = 0; i < cnt && found < 0; i++)
+            if (!strcmp(t[i].name, a->name)) found = i;
+        if (found < 0) { a->gone = 1; continue; }
+        a->client = t[found].client;
+        a->port = t[found].port;
+        a->gone = 0;
+        snprintf(a->name, sizeof a->name, "%s", t[found].name);
+        *pick = found + 1;                                      /* the index follows the port */
+    }
+}
 
 /* Who is on the sequencer: fill the OUT PORT / IN PORT candidate lists, names
  * included. Discovery order is ALSA's own (client id, then port id), so "port 3"
@@ -317,41 +518,52 @@ static void rebuild_targets(sb_t *s) {
             }
         }
     }
+    resolve_pick(s);                        /* and re-aim the picks at what is there now */
 }
 
-/* What the picker shows: None (0) is a real choice -- no devices at all -- N is
- * that port's "client:port" name, and (gone) means the chosen port has since
- * unplugged (a send is refused rather than quietly reaching everybody). */
+/* What the picker shows: None (0) is a real choice -- no devices at all -- and
+ * the pick's own name wherever it has moved to, with (gone) meaning the chosen
+ * port has since unplugged (a send is refused rather than quietly reaching
+ * everybody). */
 static const char *tg_name(sb_t *s, int out, int n) {
     if (n <= 0) return "None";
+    const aim_t *a = out ? &s->aim_out : &s->aim_in;
+    if (a->name[0]) return a->gone ? "(gone)" : a->name;
     int cnt = out ? s->ntg_out : s->ntg_in;
     if (n > cnt) return "(gone)";
     return out ? s->tg_out[n - 1].name : s->tg_in[n - 1].name;
 }
 
-/* Which readable ports this instance receives from: None (0) means nobody, N
- * means the single port IN PORT picked. Used to subscribe and to drop what was
- * subscribed before the pick changed. */
+/* Which readable ports this instance receives from: only the one IN PORT picked,
+ * by identity (see resolve_pick). Used to subscribe and to drop what was
+ * subscribed before the pick changed. None, (gone) and not-yet-resolved all mean
+ * nobody. */
 static int in_wanted(sb_t *s, int cid, int pid) {
-    if (s->recv_from <= 0) return 0;           /* None: receive from nobody */
-    if (s->recv_from > s->ntg_in) return 0;    /* gone: receive from nobody */
-    return s->tg_in[s->recv_from - 1].client == cid && s->tg_in[s->recv_from - 1].port == pid;
+    const aim_t *a = &s->aim_in;
+    if (!a->name[0] || a->gone || a->client < 0) return 0;
+    return a->client == cid && a->port == pid;
 }
 
 /* Where a send goes: 1 = dst filled with the picked port, -1 = nowhere. None (0)
  * is a destination like any other -- it is refused, not broadcast, so SEND with
- * no port picked does not spray the dump at every device on the box. */
+ * no port picked does not spray the dump at every device on the box, and a port
+ * that has vanished refuses the same way instead of reaching its neighbour. */
 static int out_target(sb_t *s, snd_seq_addr_t *dst) {
+    const aim_t *a = &s->aim_out;
     if (s->send_to <= 0) { set_status(s, "pick OUT PORT"); return -1; }
-    if (s->send_to > s->ntg_out) { set_status(s, "out port %d not found", s->send_to); return -1; }
-    dst->client = (unsigned)s->tg_out[s->send_to - 1].client;
-    dst->port = (unsigned)s->tg_out[s->send_to - 1].port;
+    if (!a->name[0] || a->gone || a->client < 0) {
+        set_status(s, "out port %d not found", s->send_to);
+        return -1;
+    }
+    dst->client = (unsigned)a->client;
+    dst->port = (unsigned)a->port;
     return 1;
 }
 
 /* OUT/IN PORT's prev & next arrows: re-read what is actually plugged in, then
  * step one place -- stopping at the last port that exists, so an arrow can never
- * walk the picker onto "(none)". */
+ * walk the picker onto "(none)". The step is a new pick: the aim is dropped and
+ * re-taken from the new index by the next rebuild. */
 static void step_target(sb_t *s, int out, int dir) {
     rebuild_targets(s);
     int *pick = out ? &s->send_to : &s->recv_from;
@@ -360,12 +572,15 @@ static void step_target(sb_t *s, int out, int dir) {
     if (v < 0) v = 0;
     if (v > cnt) v = cnt;
     *pick = v;
+    aim_clear(s, out);
     s->need_sweep = 1;                            /* the pick may drop a subscription */
 }
 
 /* ------------------------------------------------------------- sending */
 
-static int send_one(sb_t *s, const uint8_t *p, int len, const snd_seq_addr_t *dst) {
+/* One SysEx event out, addressed at OUT PORT's device (never a broadcast: a dump
+ * must not reach the other synth on the box). */
+static int emit(sb_t *s, const uint8_t *p, int len, const snd_seq_addr_t *dst) {
     snd_seq_event_t ev;
     snd_seq_ev_clear(&ev);
     snd_seq_ev_set_source(&ev, s->out_port);
@@ -376,38 +591,205 @@ static int send_one(sb_t *s, const uint8_t *p, int len, const snd_seq_addr_t *ds
     /* ext payloads need LENGTH_VARIABLE: with the cleared flags (LENGTH_FIXED)
      * output_direct rejects the event with -EINVAL (probed on x86). */
     snd_seq_ev_set_variable(&ev, len, (void *)(uintptr_t)p);
-    int r = snd_seq_event_output_direct(s->seq, &ev);
-    if (r >= 0) {                           /* remember for the echo filter */
-        if (s->echo_n < ECHO_SLOTS) s->echo[s->echo_n++] = fnv1a(p, len);
-        else {
-            memmove(s->echo, s->echo + 1, sizeof(s->echo) - sizeof s->echo[0]);
-            s->echo[ECHO_SLOTS - 1] = fnv1a(p, len);
-        }
-    }
-    return r;
+    return snd_seq_event_output_direct(s->seq, &ev);
 }
 
+/* CLOCK_MONOTONIC in ms: the echo window runs on the clock, not on anything the
+ * host, a project or a preset can move. */
+static long long mono_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+static void echo_add(sb_t *s, uint32_t h) {
+    echo_t e = { h, mono_ms() };
+    if (s->echo_n < ECHO_SLOTS) s->echo[s->echo_n++] = e;
+    else {
+        memmove(s->echo, s->echo + 1, sizeof(s->echo) - sizeof s->echo[0]);
+        s->echo[ECHO_SLOTS - 1] = e;
+    }
+}
+
+/* Our own message coming back -- but only while that is still plausible: an echo
+ * round-trips in milliseconds, so a hash last seen ECHO_MS ago is a real message
+ * (the same patch read back from the synth minutes later must count, or a
+ * round-trip test loses its replies to the filter forever). */
 static int echo_seen(sb_t *s, uint32_t h) {
+    long long now = mono_ms();
     for (int i = 0; i < s->echo_n; i++)
-        if (s->echo[i] == h) return 1;
+        if (s->echo[i].h == h && now - s->echo[i].at <= ECHO_MS) return 1;
     return 0;
 }
 
-/* BYTES: the first nbytes of b1..b8. FILE: the slot's .syx split on F0..F7 and
- * sent message by message, exactly like the app's send path. */
+static void ts_add_ms(struct timespec *t, int ms) {
+    t->tv_sec += ms / 1000;
+    t->tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (t->tv_nsec >= 1000000000L) { t->tv_sec++; t->tv_nsec -= 1000000000L; }
+}
+
+static int ts_before(const struct timespec *a, const struct timespec *b) {
+    return a->tv_sec < b->tv_sec || (a->tv_sec == b->tv_sec && a->tv_nsec < b->tv_nsec);
+}
+
+/* STATUS while a paced send runs: messages for a multi-message file, kilobytes for
+ * one huge message, nothing for the handful of BYTES. "sending..." is what do_send
+ * leaves behind, so anything else means the job is out (or refused). */
+static void tx_progress(sb_t *s) {
+    if (s->tx_direct) return;
+    if (s->tx_total > 1)
+        set_status(s, "sending %d/%d msg", s->tx_done + (s->tx_ms < s->tx_me ? 1 : 0), s->tx_total);
+    else if (s->tx_total_bytes >= 1024)
+        set_status(s, "sending %d/%d KB", s->tx_bytes / 1024,
+                   (s->tx_total_bytes + 1023) / 1024);
+}
+
+/* The queue is drained: release it and report the same STATUS a synchronous send
+ * would have left. */
+static void tx_finish(sb_t *s) {
+    int n = s->tx_done, stray = s->tx_stray, direct = s->tx_direct;
+    size_t bytes = s->tx_bytes;
+    free(s->txq);
+    s->txq = NULL;
+    s->tx_active = 0;
+    s->tx_ms = s->tx_me = 0;
+    if (direct) set_status(s, "sent %d B", (int)bytes);
+    else if (stray) set_status(s, "sent %d msg, %d B stray", n, stray);
+    else set_status(s, "sent %d msg, %d B", n, (int)bytes);
+}
+
+static void tx_fail(sb_t *s, int r) {
+    int n = s->tx_done, direct = s->tx_direct;
+    free(s->txq);
+    s->txq = NULL;
+    s->tx_active = 0;
+    s->tx_ms = s->tx_me = 0;
+    if (direct) set_status(s, "send failed (%d)", r);
+    else set_status(s, "send failed after %d msg (%d)", n, r);
+}
+
+/* Hand a loaded buffer to the tx thread. total_msgs/total_bytes only feed the
+ * progress line; direct = the buffer is one message already (BYTES), so nothing
+ * is scanned for F0..F7. */
+static void tx_begin(sb_t *s, uint8_t *q, size_t len, const snd_seq_addr_t *dst,
+                     int direct, int total_msgs, size_t total_bytes) {
+    s->txq = q;
+    s->txq_len = len;
+    s->tx_pos = 0;
+    s->tx_ms = s->tx_me = 0;
+    s->tx_hash = 2166136261u;
+    s->tx_direct = direct;
+    s->tx_done = 0;
+    s->tx_total = total_msgs;
+    s->tx_bytes = 0;
+    s->tx_total_bytes = total_bytes;
+    s->tx_stray = 0;
+    s->tx_dst = *dst;
+    clock_gettime(CLOCK_REALTIME, &s->tx_due);   /* the first block goes out now */
+    s->tx_active = 1;
+    set_status(s, "sending...");
+    pthread_cond_broadcast(&s->tx_cv);
+}
+
+/* One tick of the paced send: the next tx_buf-byte block of the open message, or
+ * the first block of the next one, never before tx_due. A block is a slice of the
+ * same F0..F7 stream -- no framing is added, the receiver sees the identical byte
+ * sequence, just not all at once (Midi-OX's "buffer size + delay between buffers").
+ * Called with s->lock held, from tx_worker. */
+static void tx_step(sb_t *s, const struct timespec *now) {
+    if (s->tx_ms >= s->tx_me) {                       /* open the next message */
+        if (s->tx_direct) {
+            if (s->tx_pos >= s->txq_len) { tx_finish(s); return; }
+            s->tx_ms = 0;
+            s->tx_me = s->txq_len;
+        } else {
+            size_t i = s->tx_pos;
+            while (i < s->txq_len && s->txq[i] != 0xF0) i++;      /* stray bytes */
+            s->tx_stray += (int)(i - s->tx_pos);
+            if (i >= s->txq_len) { s->tx_pos = i; tx_finish(s); return; }
+            size_t j = i + 1;
+            while (j < s->txq_len && s->txq[j] != 0xF7) j++;
+            if (j >= s->txq_len) {                                /* unterminated tail */
+                s->tx_stray += (int)(s->txq_len - i);
+                s->tx_pos = s->txq_len;
+                tx_finish(s);
+                return;
+            }
+            s->tx_pos = s->tx_ms = i;
+            s->tx_me = j + 1;
+        }
+        s->tx_hash = 2166136261u;
+    }
+    int n = (int)(s->tx_me - s->tx_pos);
+    if (n > s->tx_buf) n = s->tx_buf;
+    int r = emit(s, s->txq + s->tx_pos, n, &s->tx_dst);
+    if (r < 0) { tx_fail(s, r); return; }
+    for (int i = 0; i < n; i++) s->tx_hash = (s->tx_hash ^ s->txq[s->tx_pos + i]) * 16777619u;
+    s->tx_pos += (size_t)n;
+    s->tx_bytes += (size_t)n;
+    if (s->tx_pos < s->tx_me) {                     /* more of this message to come */
+        s->tx_due = *now;
+        ts_add_ms(&s->tx_due, s->tx_gap);
+        tx_progress(s);
+        return;
+    }
+    /* the message is out whole: hash it for the echo filter (the receiver
+     * reassembles the blocks, so it echoes the whole message, not a slice) */
+    echo_add(s, s->tx_hash);
+    s->tx_done++;
+    tx_progress(s);
+    s->tx_ms = s->tx_me = 0;
+    if (s->tx_direct) { tx_finish(s); return; }
+    size_t k = s->tx_pos;
+    while (k < s->txq_len && s->txq[k] != 0xF0) k++;              /* anything left? */
+    s->tx_stray += (int)(k - s->tx_pos);
+    s->tx_pos = k;
+    if (k >= s->txq_len) { tx_finish(s); return; }
+    s->tx_due = *now;
+    ts_add_ms(&s->tx_due, s->tx_delay);            /* Midi-OX's "delay after F7" */
+}
+
+/* The pacing thread: sleeps on tx_cv until tx_due, emits one block, repeats. Not
+ * the reader thread -- a 1 ms block gap needs sub-POLL_MS timing and neither loop
+ * may stall the other's sweep or drain. */
+static void *tx_worker(void *arg) {
+    sb_t *s = (sb_t *)arg;
+    pthread_mutex_lock(&s->lock);
+    while (!s->tx_quit) {
+        if (!s->tx_active) { pthread_cond_wait(&s->tx_cv, &s->lock); continue; }
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        if (ts_before(&now, &s->tx_due)) {
+            pthread_cond_timedwait(&s->tx_cv, &s->lock, &s->tx_due);
+            continue;
+        }
+        if (ts_before(&s->tx_due, &now)) clock_gettime(CLOCK_REALTIME, &now);
+        tx_step(s, &now);
+    }
+    if (s->tx_active) {                      /* quitting mid-send: drop the queue */
+        free(s->txq);
+        s->txq = NULL;
+        s->tx_active = 0;
+    }
+    pthread_mutex_unlock(&s->lock);
+    return NULL;
+}
+
+/* SEND: validate, load the file, queue it. Nothing is transmitted here -- the host
+ * thread must not sleep out a paced dump -- so STATUS reads "sending..." until the
+ * tx thread reports the outcome. BYTES is queued too, for one code path. */
 static void do_send(sb_t *s) {
     if (!s->seq) { set_status(s, "no ALSA sequencer"); return; }
+    if (s->tx_active) { set_status(s, "already sending"); return; }
     rebuild_targets(s);                        /* the pick may have just appeared */
     snd_seq_addr_t dst;
     if (out_target(s, &dst) < 0) return;       /* out_target already said why */
-    const snd_seq_addr_t *dp = &dst;
     if (s->send_src == 1) {
-        uint8_t buf[8];
         int n = clampi(s->nbytes, 1, 8);
-        for (int i = 0; i < n; i++) buf[i] = (uint8_t)s->b[i];
-        int r = send_one(s, buf, n, dp);
-        if (r >= 0) set_status(s, "sent %d B", n);
-        else set_status(s, "send failed (%d)", r);
+        uint8_t *q = (uint8_t *)malloc((size_t)n);
+        if (!q) { set_status(s, "out of memory"); return; }
+        for (int i = 0; i < n; i++) q[i] = (uint8_t)s->b[i];
+        tx_begin(s, q, (size_t)n, &dst, 1, 1, (size_t)n);
         return;
     }
     const char *name = slot_name(s);
@@ -425,32 +807,28 @@ static void do_send(sb_t *s) {
     fclose(f);
     if (!buf || got != (size_t)sz) { free(buf); set_status(s, "can't read %s", name); return; }
 
-    /* split on complete F0..F7 messages; stray bytes count but never go out */
-    int sent = 0, bytes = 0, stray = 0, r = 0;
-    size_t i = 0;
+    /* split on complete F0..F7 messages the way the tx thread will, for the
+     * progress line; stray bytes count but never go out */
+    int msgs = 0;
+    size_t bytes = 0, i = 0;
     while (i < got) {
         if (buf[i] == 0xF0) {
             size_t j = i + 1;
             while (j < got && buf[j] != 0xF7) j++;
-            if (j < got) {
-                r = send_one(s, buf + i, (int)(j - i + 1), dp);
-                if (r < 0) break;
-                sent++;
-                bytes += (int)(j - i + 1);
-                i = j + 1;
-            } else { stray += (int)(got - i); break; }   /* unterminated tail */
-        } else { stray++; i++; }
+            if (j >= got) break;                     /* unterminated tail */
+            msgs++;
+            bytes += j - i + 1;
+            i = j + 1;
+        } else i++;
     }
-    free(buf);
-    if (r < 0) set_status(s, "send failed after %d msg (%d)", sent, r);
-    else if (stray) set_status(s, "sent %d msg, %d B stray", sent, stray);
-    else set_status(s, "sent %d msg, %d B", sent, bytes);
+    tx_begin(s, buf, (size_t)sz, &dst, 0, msgs, bytes);
 }
 
-/* SAVE RX: the last received message to messages/rx_NNN.syx, then re-scan so it
- * becomes a slot like any other file. */
+/* SAVE RX: the whole capture -- every message since CLEAR, one normal
+ * multi-message .syx, which is what a bank dump should have been all along -- to
+ * messages/rx_NNN.syx, then re-scan so it becomes a slot like any other file. */
 static void do_save_rx(sb_t *s) {
-    if (s->rx_len <= 0) { set_status(s, "nothing to save"); return; }
+    if (!s->cap || s->cap_len <= 0) { set_status(s, "nothing to save"); return; }
     if (!s->dir[0]) { set_status(s, "no folder"); return; }
     char path[sizeof s->dir + 24];
     int idx = 1;
@@ -462,11 +840,12 @@ static void do_save_rx(sb_t *s) {
     if (idx >= 1000) { set_status(s, "rx_ slots full"); return; }
     FILE *f = fopen(path, "wb");
     if (!f) { set_status(s, "can't write rx_%03d.syx", idx); return; }
-    size_t w = fwrite(s->rx_bytes, 1, (size_t)s->rx_len, f);
+    size_t w = fwrite(s->cap, 1, (size_t)s->cap_len, f);
     fclose(f);
-    if (w != (size_t)s->rx_len) { set_status(s, "write failed"); return; }
+    if (w != (size_t)s->cap_len) { set_status(s, "write failed"); return; }
     scan_dir(s);
-    set_status(s, "saved rx_%03d.syx", idx);
+    set_status(s, "saved rx_%03d.syx (%d msg, %d KB)", idx, s->cap_msgs,
+               (s->cap_len + 1023) / 1024);
 }
 
 /* ------------------------------------------------------------- sequencer */
@@ -593,15 +972,23 @@ static void unsubscribe_all(sb_t *s) {
     }
 }
 
-/* Accept one complete F0..F7 message: filter our own echo, keep it for SAVE RX,
- * show its head and who sent it, count it (RX TOTAL = complete messages, wraps
- * 0..999). The sender's name is what makes an unexplained RX TOTAL climb
- * diagnosable: STATUS says which client is talking. */
+/* Accept one complete F0..F7 message: filter our own echo, APPEND it to the
+ * capture (so a bank dump's 200-odd blocks all survive, not just the newest),
+ * show it and who sent it, count it (RX TOTAL = complete messages, wraps 0..999),
+ * and move RX MSG to it. The sender's name is what makes an unexplained RX TOTAL
+ * climb diagnosable: STATUS says which client is talking, and how big the capture
+ * it is building has grown. */
 static void accept_msg(sb_t *s, const uint8_t *p, int len, int src_client) {
     if (echo_seen(s, fnv1a(p, len))) return;      /* our own message coming back */
-    if (len > MAX_RX) { set_status(s, "rx %d B too big", len); return; }
-    memcpy(s->rx_bytes, p, (size_t)len);
-    s->rx_len = len;
+    if (!s->cap) { set_status(s, "rx %d B: no capture buffer", len); return; }
+    if (s->cap_msgs >= CAP_MSGS || (long long)s->cap_len + len > CAP_MAX) {
+        set_status(s, "capture full (%d msg/%d KB)", s->cap_msgs, CAP_MAX / 1024);
+        return;
+    }
+    memcpy(s->cap + s->cap_len, p, (size_t)len);
+    s->cap_off[s->cap_msgs++] = s->cap_len;
+    s->cap_len += len;
+    s->rx_msg = s->cap_msgs;                     /* a new message moves RX to the end */
     s->rx_total = (s->rx_total + 1) % 1000;
     char from[40];
     snd_seq_client_info_t *ci;
@@ -610,7 +997,8 @@ static void accept_msg(sb_t *s, const uint8_t *p, int len, int src_client) {
         const char *nm = snd_seq_client_info_get_name(ci);
         snprintf(from, sizeof from, "%s", (nm && nm[0]) ? nm : "?");
     } else snprintf(from, sizeof from, "client %d", src_client);
-    set_status(s, "rx %d B from %s", len, from);
+    set_status(s, "rx %d B from %s (%d msg, %d KB)", len, from, s->cap_msgs,
+               (s->cap_len + 1023) / 1024);
 }
 
 /* Drain everything queued: one poll() wakes us, this loop takes it all (poll
@@ -707,10 +1095,21 @@ static void *reader(void *arg) {
  * prev/next tap, a chunk restore). */
 static unsigned rev_hash(sb_t *s) {
     uint32_t h = 2166136261u;
-    int v[15] = { s->message, s->send_src, s->nbytes, s->listen, s->rx_total,
+    /* A file name too long for the MESSAGE box scrolls through it. Advancing the
+     * phase HERE is what makes it move: rev_scan sees display_rev change and asks
+     * the host to repaint, which re-reads message_display (a Label never wraps). */
+    const char *nm = slot_name(s);
+    marq_sync(s);                              /* resets the phase when the selection moved */
+    if (nm && (int)strlen(nm) > MARQ_W && (s->marq_tick++ & 1) == 0)
+        s->marq_ph = (s->marq_ph + 1) % (unsigned)((int)strlen(nm) + MARQ_GAP);
+    else if (!nm || (int)strlen(nm) <= MARQ_W)
+        s->marq_ph = 0;                          /* fits: stop where it started */
+    h = (h ^ s->marq_ph) * 16777619u;
+    int v[19] = { s->message, s->send_src, s->nbytes, s->listen, s->rx_total,
                   s->b[0], s->b[1], s->b[2], s->b[3], s->b[4], s->b[5], s->b[6], s->b[7],
-                  s->send_to, s->recv_from };
-    for (int i = 0; i < 15; i++) {
+                  s->send_to, s->recv_from, s->rx_msg,
+                  s->tx_delay, s->tx_buf, s->tx_gap };
+    for (int i = 0; i < 19; i++) {
         h = (h ^ (uint32_t)v[i]) * 16777619u;
         h = (h ^ (uint32_t)(v[i] >> 8)) * 16777619u;
         h = (h ^ (uint32_t)(v[i] >> 16)) * 16777619u;
@@ -740,6 +1139,15 @@ static int state_get(sb_t *s, char *buf, int n) {
     for (int i = 0; i < 8 && o < n; i++) { c = put(buf + o, n - o, "b%d=%d;", i + 1, s->b[i]); o += c; }
     if (o < n) { c = put(buf + o, n - o, "listen=%d;", s->listen); o += c; }
     if (o < n) { c = put(buf + o, n - o, "send_to=%d;recv_from=%d;", s->send_to, s->recv_from); o += c; }
+    /* and the pick's identity: an index alone comes back aimed at a different
+     * device once the list has moved, exactly as file= does for a message slot */
+    {   const char *sn = aim_name(s, 1), *rn = aim_name(s, 0);
+        if (sn[0] && o < n) { c = put(buf + o, n - o, "send_name=%s;", sn); o += c; }
+        if (rn[0] && o < n) { c = put(buf + o, n - o, "recv_name=%s;", rn); o += c; }
+    }
+    if (o < n) { c = put(buf + o, n - o, "tx_delay=%d;tx_buf=%d;tx_gap=%d;",
+                         s->tx_delay, s->tx_buf, s->tx_gap); o += c; }
+    if (o < n) { c = put(buf + o, n - o, "rx_msg=%d;", s->rx_msg); o += c; }
     const char *nm = slot_name(s);
     if (nm && o < n) { c = put(buf + o, n - o, "file=%s;", nm); o += c; }
     if (o >= n && n > 0) { buf[n - 1] = 0; o = n - 1; }
@@ -747,9 +1155,11 @@ static int state_get(sb_t *s, char *buf, int n) {
 }
 
 /* "k=v;..." lines. file= wins over message= when the name still exists, so a
- * preset follows the file even if the folder shifted around it. */
+ * preset follows the file even if the folder shifted around it; send_name= /
+ * recv_name= win over send_to= / recv_from= the same way, for the same reason. */
 static void state_set(sb_t *s, const char *str) {
     char file[SB_NAME] = "";
+    char sname[SB_TEXT] = "", rname[SB_TEXT] = "";
     const char *p = str;
     while (*p) {
         const char *eq = strchr(p, '=');
@@ -761,19 +1171,29 @@ static void state_set(sb_t *s, const char *str) {
         int c = vlen < SB_NAME - 1 ? vlen : SB_NAME - 1;
         memcpy(v, eq + 1, (size_t)c);
         v[c] = 0;
-        if (klen == 7 && !memcmp(k, "message", 7)) s->message = clampi(atoi(v), 1, 16);
+        if (klen == 7 && !memcmp(k, "message", 7)) s->message = clampi(atoi(v), 1, MAX_MSGS);
         else if (klen == 8 && !memcmp(k, "send_src", 8)) s->send_src = opt_index(v, "FILE", "BYTES");
         else if (klen == 6 && !memcmp(k, "nbytes", 6)) s->nbytes = clampi(atoi(v), 1, 8);
         else if (klen == 2 && k[0] == 'b' && k[1] >= '1' && k[1] <= '8') s->b[k[1] - '1'] = clampi(atoi(v), 0, 255);
         else if (klen == 6 && !memcmp(k, "listen", 6)) s->listen = opt_index(v, "OFF", "ON");
         else if (klen == 7 && !memcmp(k, "send_to", 7)) s->send_to = clampi(atoi(v), 0, MAX_TG);
         else if (klen == 9 && !memcmp(k, "recv_from", 9)) s->recv_from = clampi(atoi(v), 0, MAX_TG);
+        else if (klen == 9 && !memcmp(k, "send_name", 9)) snprintf(sname, sizeof sname, "%s", v);
+        else if (klen == 9 && !memcmp(k, "recv_name", 9)) snprintf(rname, sizeof rname, "%s", v);
+        else if (klen == 8 && !memcmp(k, "tx_delay", 8)) s->tx_delay = clampi(atoi(v), 0, 1000);
+        else if (klen == 6 && !memcmp(k, "tx_buf", 6)) s->tx_buf = clampi(atoi(v), 64, 4096);
+        else if (klen == 6 && !memcmp(k, "tx_gap", 6)) s->tx_gap = clampi(atoi(v), 0, 1000);
+        else if (klen == 6 && !memcmp(k, "rx_msg", 6)) s->rx_msg = clampi(atoi(v), 1, CAP_MSGS);
         else if (klen == 4 && !memcmp(k, "file", 4)) snprintf(file, sizeof file, "%s", v);
         p = semi ? semi + 1 : p + strlen(p);
     }
     if (file[0])
         for (int i = 0; i < s->nmsgs; i++)
             if (!strcmp(s->names[i], file)) { s->message = i + 1; break; }
+    marq_sync(s);                     /* a restored selection starts its window at the head */
+    aim_restore(s, 1, sname);         /* the picks come back by name when they have one */
+    aim_restore(s, 0, rname);
+    s->need_sweep = 1;                /* settle the names and re-wire at once */
 }
 
 static int sb_get(void *inst, const char *key, char *buf, int n) {
@@ -785,21 +1205,29 @@ static int sb_get(void *inst, const char *key, char *buf, int n) {
     else if (!strcmp(key, "display_rev")) r = put(buf, n, "%08x", rev_hash(s));
     else if (!strcmp(key, "message")) r = put(buf, n, "%d", s->message);
     else if (!strcmp(key, "message_display")) {
-        const char *nm = slot_name(s);
-        r = put(buf, n, "%s", nm ? nm : (s->nmsgs ? "(none)" : "(empty)"));
+        char nm[SB_NAME];
+        r = put(buf, n, "%s", msg_name(s, nm, sizeof nm));
     }
     else if (!strcmp(key, "send_src")) r = put(buf, n, "%d", s->send_src);
     else if (!strcmp(key, "nbytes")) r = put(buf, n, "%d", s->nbytes);
     else if (!strcmp(key, "listen")) r = put(buf, n, "%d", s->listen);
     else if (!strcmp(key, "send_to")) r = put(buf, n, "%d", s->send_to);
     else if (!strcmp(key, "recv_from")) r = put(buf, n, "%d", s->recv_from);
+    else if (!strcmp(key, "tx_delay")) r = put(buf, n, "%d", s->tx_delay);
+    else if (!strcmp(key, "tx_buf")) r = put(buf, n, "%d", s->tx_buf);
+    else if (!strcmp(key, "tx_gap")) r = put(buf, n, "%d", s->tx_gap);
     else if (!strcmp(key, "send_to_display")) r = put(buf, n, "%s", tg_name(s, 1, s->send_to));
     else if (!strcmp(key, "recv_from_display")) r = put(buf, n, "%s", tg_name(s, 0, s->recv_from));
     else if (!strcmp(key, "rx_total")) r = put(buf, n, "%d", s->rx_total);
+    else if (!strcmp(key, "rx_msg")) r = put(buf, n, "%d", s->rx_msg);
+    else if (!strcmp(key, "rx_msg_display"))
+        r = s->cap_msgs > 0 ? put(buf, n, "%d/%d", clampi(s->rx_msg, 1, s->cap_msgs), s->cap_msgs)
+                            : put(buf, n, "-");
     else if (!strncmp(key, "b", 1) && key[1] >= '1' && key[1] <= '8' && !key[2]) r = put(buf, n, "%d", s->b[key[1] - '1']);
     else if (!strcmp(key, "send") || !strcmp(key, "msg_prev") || !strcmp(key, "msg_next") ||
              !strcmp(key, "save_rx") || !strcmp(key, "rescan") ||
              !strcmp(key, "clear_rx") ||
+             !strcmp(key, "rx_msg_prev") || !strcmp(key, "rx_msg_next") ||
              !strcmp(key, "send_to_prev") || !strcmp(key, "send_to_next") ||
              !strcmp(key, "recv_from_prev") || !strcmp(key, "recv_from_next"))
         r = put(buf, n, "0");                    /* momentary springs back */
@@ -820,7 +1248,7 @@ static void sb_set(void *inst, const char *key, const char *val) {
     pthread_mutex_lock(&s->lock);
     s->sel_dirty = 1;                       /* any set may have changed what TX shows */
     if (!strcmp(key, "state")) state_set(s, val);
-    else if (!strcmp(key, "message")) s->message = clampi(atoi(val), 1, 16);
+    else if (!strcmp(key, "message")) { s->message = clampi(atoi(val), 1, MAX_MSGS); marq_sync(s); }
     else if (!strcmp(key, "send_src")) s->send_src = opt_index(val, "FILE", "BYTES");
     else if (!strcmp(key, "nbytes")) s->nbytes = clampi(atoi(val), 1, 8);
     else if (!strncmp(key, "b", 1) && key[1] >= '1' && key[1] <= '8' && !key[2])
@@ -834,8 +1262,23 @@ static void sb_set(void *inst, const char *key, const char *val) {
         }
     }
     else if (!strcmp(key, "send")) { if (atoi(val) > 0) do_send(s); }
-    else if (!strcmp(key, "send_to")) { s->send_to = clampi(atoi(val), 0, MAX_TG); s->need_sweep = 1; }
-    else if (!strcmp(key, "recv_from")) { s->recv_from = clampi(atoi(val), 0, MAX_TG); s->need_sweep = 1; }
+    else if (!strcmp(key, "tx_delay")) s->tx_delay = clampi(atoi(val), 0, 1000);
+    else if (!strcmp(key, "tx_buf")) s->tx_buf = clampi(atoi(val), 64, 4096);
+    else if (!strcmp(key, "tx_gap")) s->tx_gap = clampi(atoi(val), 0, 1000);
+    else if (!strcmp(key, "rx_msg"))
+        s->rx_msg = clampi(atoi(val), 1, s->cap_msgs ? s->cap_msgs : 1);
+    else if (!strcmp(key, "rx_msg_prev")) {
+        if (atoi(val) > 0 && s->rx_msg > 1) s->rx_msg--;
+    }
+    else if (!strcmp(key, "rx_msg_next")) {
+        if (atoi(val) > 0 && s->rx_msg < s->cap_msgs) s->rx_msg++;
+    }
+    else if (!strcmp(key, "send_to")) {
+        s->send_to = clampi(atoi(val), 0, MAX_TG); aim_clear(s, 1); s->need_sweep = 1;
+    }
+    else if (!strcmp(key, "recv_from")) {
+        s->recv_from = clampi(atoi(val), 0, MAX_TG); aim_clear(s, 0); s->need_sweep = 1;
+    }
     else if (!strcmp(key, "send_to_prev")) { if (atoi(val) > 0) step_target(s, 1, -1); }
     else if (!strcmp(key, "send_to_next")) { if (atoi(val) > 0) step_target(s, 1, +1); }
     else if (!strcmp(key, "recv_from_prev")) { if (atoi(val) > 0) step_target(s, 0, -1); }
@@ -843,7 +1286,8 @@ static void sb_set(void *inst, const char *key, const char *val) {
     else if (!strcmp(key, "save_rx")) { if (atoi(val) > 0) do_save_rx(s); }
     else if (!strcmp(key, "clear_rx")) {
         if (atoi(val) > 0) {
-            s->rx_len = 0; s->acc_len = 0; s->rx_total = 0;
+            s->cap_len = 0; s->cap_msgs = 0; s->rx_msg = 1;
+            s->acc_len = 0; s->rx_total = 0;
             set_status(s, "cleared");
         }
     }
@@ -874,6 +1318,7 @@ static void *sb_create(const char *data_dir) {
     pthread_mutex_init(&s->lock, &ma);
     pthread_mutexattr_destroy(&ma);
     s->quit_pipe[0] = s->quit_pipe[1] = -1;
+    pthread_cond_init(&s->tx_cv, NULL);
     s->message = 1;
     s->send_src = 0;                        /* FILE */
     s->nbytes = 6;
@@ -881,7 +1326,14 @@ static void *sb_create(const char *data_dir) {
     s->listen = 0;                        /* LISTEN defaults OFF (params.json): opt-in receiving */
     s->send_to = 0;                       /* OUT PORT default None: no device picked */
     s->recv_from = 0;                     /* IN PORT default None: no device picked */
+    s->tx_delay = 10;                     /* pacing defaults (params.json): gentle, not full
+                                           * throttle -- a 32 KB dump overruns a synth's input
+                                           * buffer when it arrives all at once */
+    s->tx_buf = 512;
+    s->tx_gap = 1;
+    s->rx_msg = 1;                        /* RX shows msg 1 of an empty capture: "-" */
     s->sel_dirty = 1;                     /* TX reads the selection on first use */
+    s->cap = (uint8_t *)calloc(1, CAP_MAX);
     set_folder(s, data_dir);
     scan_dir(s);
     s->sel_dirty = 1;                     /* scan_dir rebuilt the slot list */
@@ -920,16 +1372,26 @@ static void *sb_create(const char *data_dir) {
     if (!alsa) {
         snprintf(s->port_str, sizeof s->port_str, "no ALSA sequencer");
         set_status(s, "ALSA unavailable");
-    } else set_status(s, "ready");
+    } else if (s->cap) set_status(s, "ready");
+    else set_status(s, "no capture buffer");   /* SAVE RX stays refused */
 
     if (alsa && pipe(s->quit_pipe) == 0 && pthread_create(&s->thr, NULL, reader, s) == 0)
         s->have_thread = 1;
+    if (pthread_create(&s->tx_thr, NULL, tx_worker, s) == 0) s->tx_thr_on = 1;
     return s;
 }
 
 static void sb_destroy(void *inst) {
     sb_t *s = (sb_t *)inst;
     if (!s) return;
+    if (s->tx_thr_on) {                     /* stop pacing first: it emits on s->seq */
+        pthread_mutex_lock(&s->lock);
+        s->tx_quit = 1;
+        pthread_cond_broadcast(&s->tx_cv);
+        pthread_mutex_unlock(&s->lock);
+        pthread_join(s->tx_thr, NULL);
+        s->tx_thr_on = 0;
+    }
     if (s->have_thread) {                    /* wake the reader, then wait for it */
         char c = 1;
         ssize_t w = write(s->quit_pipe[1], &c, 1);
@@ -942,7 +1404,9 @@ static void sb_destroy(void *inst) {
     pthread_mutex_unlock(&s->lock);
     if (s->quit_pipe[0] >= 0) close(s->quit_pipe[0]);
     if (s->quit_pipe[1] >= 0) close(s->quit_pipe[1]);
+    pthread_cond_destroy(&s->tx_cv);
     pthread_mutex_destroy(&s->lock);
+    free(s->cap);
     free(s);
 }
 

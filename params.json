@@ -1,7 +1,7 @@
 {
  "name": "Sysex Bandit",
  "params": [
-  {"key": "message", "name": "MESSAGE", "default": 1, "min": 1, "max": 16, "display": "int", "dynamic_display": true},
+  {"key": "message", "name": "MESSAGE", "default": 1, "min": 1, "max": 64, "display": "int", "dynamic_display": true},
   {"key": "send_src", "name": "SOURCE", "default": "FILE", "options": ["FILE", "BYTES"]},
   {"key": "nbytes", "name": "BYTE COUNT", "default": 6, "min": 1, "max": 8, "display": "int"},
   {"key": "b1", "name": "BYTE 1", "default": 240, "min": 0, "max": 255, "display": "int"},
@@ -31,6 +31,12 @@
   {"key": "recv_from", "name": "IN PORT", "default": 0, "min": 0, "max": 64, "display": "int", "dynamic_display": true},
   {"key": "recv_from_prev", "name": "IN PREV", "default": 0, "min": 0, "max": 1, "momentary": true, "type": "trigger"},
   {"key": "recv_from_next", "name": "IN NEXT", "default": 0, "min": 0, "max": 1, "momentary": true, "type": "trigger"},
+  {"key": "tx_delay", "name": "TX DELAY", "default": 10, "min": 0, "max": 1000, "display": "int"},
+  {"key": "tx_buf", "name": "TX BUF", "default": 512, "min": 64, "max": 4096, "display": "int"},
+  {"key": "tx_gap", "name": "TX GAP", "default": 1, "min": 0, "max": 1000, "display": "int"},
+  {"key": "rx_msg", "name": "RX MSG", "default": 1, "min": 1, "max": 4096, "display": "int", "dynamic_display": true},
+  {"key": "rx_msg_prev", "name": "RX MSG PREV", "default": 0, "min": 0, "max": 1, "momentary": true, "type": "trigger"},
+  {"key": "rx_msg_next", "name": "RX MSG NEXT", "default": 0, "min": 0, "max": 1, "momentary": true, "type": "trigger"},
   {"key": "tx2", "name": "TX 2", "default": 0, "min": 0, "max": 0, "display": "string", "type": "readout"},
   {"key": "tx3", "name": "TX 3", "default": 0, "min": 0, "max": 0, "display": "string", "type": "readout"},
   {"key": "tx4", "name": "TX 4", "default": 0, "min": 0, "max": 0, "display": "string", "type": "readout"},
@@ -47,6 +53,8 @@
                              "send_to", "send_to_prev", "send_to_next"]},
   {"label": "BYTES", "keys": ["nbytes", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8"]},
   {"label": "RECV", "keys": ["listen", "recv_from", "recv_from_prev", "recv_from_next",
-                             "rx", "rx_total", "save_rx", "clear_rx", "tx", "status", "port", "folder"]}
+                             "rx", "rx_total", "rx_msg", "rx_msg_prev", "rx_msg_next",
+                             "save_rx", "clear_rx", "tx", "status", "port", "folder"]},
+  {"label": "SPEED", "keys": ["tx_delay", "tx_buf", "tx_gap"]}
  ]
 }
