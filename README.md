@@ -14,7 +14,7 @@ ALSA sequencer ports the plugin opens itself.
 | Device | Zip |
 |---|---|
 | Gen 1 (MPC Live, Live II, One, X, Key, Force) | `Sysex-Bandit-1.0.1-mpc-armv7.zip` |
-| Gen 2 (the "3" models) | `Sysex-Bandit-1.0.1-mpc-aarch64.zip` |
+| Gen 2 (Live 3, XL, and all G2 models) | `Sysex-Bandit-1.0.1-mpc-aarch64.zip` |
 
 The installer checks the architecture and refuses the wrong one. Both builds
 target MPC OS 3.x.
